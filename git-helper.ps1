@@ -1166,6 +1166,230 @@ function Invoke-AmendForcePush {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# [12] Multi-Pick Squash ─ Pick N commits from anywhere, squash into ONE commit
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Invoke-MultiPickSquash {
+    Show-Banner
+    wh "  [ 12 ]  Multi-Pick Squash  ─  N commits from anywhere -> ONE commit" Yellow
+    Sep ; wh ""
+    wh "  Pick several commits (from any branch, in any order) and squash" DarkGray
+    wh "  them into a single commit on a new or existing branch." DarkGray
+    wh "  Type Q at any prompt to cancel." DarkGray ; wh ""
+
+    $origBranch = Get-CurrentBranch
+    if (-not $origBranch) { wh "  [X] Cannot determine current branch." Red; Pause-Return; return }
+
+    # Cherry-pick requires a clean working tree
+    $dirty = & git status --porcelain 2>&1
+    if ($dirty) {
+        wh "  [X] Working tree is not clean. Commit, stash, or discard changes first." Red
+        wh ""
+        foreach ($l in $dirty) { wh "      $l" DarkRed }
+        Pause-Return; return
+    }
+
+    wh "  STEP 1 / 3  ─  Commits to pick  (in the order they'll be applied)" DarkCyan ; wh ""
+    $count = 0
+    while ($true) {
+        $n = Ask "How many commits to squash together? (2-10):"
+        if (Is-Quit $n) { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
+        if ($n -match '^\d+$' -and [int]$n -ge 2 -and [int]$n -le 10) { $count = [int]$n; break }
+        wh "  [!] Enter a number between 2 and 10." Red
+    }
+    wh ""
+
+    $hashes = [System.Collections.Generic.List[string]]::new()
+    for ($i = 1; $i -le $count; $i++) {
+        while ($true) {
+            $h = Ask "Commit $i of $count (hash):"
+            if (Is-Quit $h) { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
+            if ([string]::IsNullOrWhiteSpace($h)) { wh "  [!] Cannot be empty." Red; continue }
+            if (-not (Test-Hash $h))              { wh "  [!] Invalid git hash." Red; continue }
+            & git rev-parse --verify "$h^{commit}" 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { wh "  [!] Commit '$h' not found in this repo." Red; continue }
+            $hashes.Add($h)
+            break
+        }
+    }
+    wh "" ; Sep ; wh ""
+
+    wh "  STEP 2 / 3  ─  Target branch" DarkCyan ; wh ""
+    wh "    [1]  Create a NEW branch" White
+    wh "    [2]  Use an EXISTING branch" White
+    wh ""
+    $createNew = $false
+    while ($true) {
+        $s = Ask "Select [1 or 2]:"
+        if (Is-Quit $s) { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
+        if ($s -eq '1') { $createNew = $true; break }
+        if ($s -eq '2') { $createNew = $false; break }
+        wh "  [!] Enter 1 or 2." Red
+    }
+    wh ""
+
+    $targetBranch = "" ; $baseRef = ""
+    if ($createNew) {
+        while ($true) {
+            $targetBranch = Ask "New branch name:"
+            if (Is-Quit $targetBranch)                       { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
+            if ([string]::IsNullOrWhiteSpace($targetBranch)) { wh "  [!] Cannot be empty." Red; continue }
+            & git rev-parse --verify $targetBranch 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { wh "  [!] Branch '$targetBranch' already exists. Choose a different name." Red; continue }
+            break
+        }
+        wh ""
+        while ($true) {
+            $baseRef = Ask "Base branch/commit for '$targetBranch' (blank = current '$origBranch'):"
+            if (Is-Quit $baseRef) { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
+            if ([string]::IsNullOrWhiteSpace($baseRef)) { $baseRef = $origBranch }
+            & git rev-parse --verify $baseRef 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { wh "  [!] '$baseRef' is not a valid branch/commit." Red; continue }
+            break
+        }
+    } else {
+        while ($true) {
+            $targetBranch = Ask "Existing branch name:"
+            if (Is-Quit $targetBranch)                       { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
+            if ([string]::IsNullOrWhiteSpace($targetBranch)) { wh "  [!] Cannot be empty." Red; continue }
+            & git rev-parse --verify $targetBranch 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { wh "  [!] Branch '$targetBranch' does not exist." Red; continue }
+            break
+        }
+    }
+    wh "" ; Sep ; wh ""
+
+    wh "  STEP 3 / 3  ─  Combined commit message" DarkCyan ; wh ""
+    $msg = ""
+    while ($true) {
+        $msg = Ask "Commit message:"
+        if (Is-Quit $msg)                       { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
+        if ([string]::IsNullOrWhiteSpace($msg)) { wh "  [!] Cannot be empty." Red; continue }
+        break
+    }
+    wh "" ; Sep ; wh ""
+
+    wh "  CONFIRM" DarkCyan ; wh ""
+    $rows = [System.Collections.Generic.List[string]]::new()
+    $rows.Add("Commits (in apply order):")
+    for ($i = 0; $i -lt $hashes.Count; $i++) {
+        $summary = [string](& git log -1 "--format=%h %s" $hashes[$i] 2>&1)
+        $rows.Add("  $($i+1). $(Clip $summary 50)")
+    }
+    if ($createNew) {
+        $rows.Add("Target branch   : $targetBranch  (NEW, based on $baseRef)")
+    } else {
+        $rows.Add("Target branch   : $targetBranch  (existing)")
+    }
+    $rows.Add("New message     : $(Clip $msg)")
+    Draw-Box $rows.ToArray()
+    wh ""
+    $go = Ask "Proceed? [Y/N]:"
+    if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+    wh "" ; Sep ; wh ""
+    wh "  Executing..." DarkCyan ; wh ""
+
+    # Step 1: get onto the target branch
+    if ($createNew) {
+        wh "  >> git checkout -b $targetBranch $baseRef" DarkGray
+        $out = & git checkout -b $targetBranch $baseRef 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            wh "  [X] Failed to create '$targetBranch'" Red
+            foreach ($l in $out) { wh "      $l" DarkRed }
+            Pause-Return; return
+        }
+        wh "  [OK] Created and switched to '$targetBranch'" Green ; wh ""
+    } else {
+        if (-not (Invoke-Checkout $targetBranch)) { Pause-Return; return }
+        wh ""
+    }
+
+    # Step 2: cherry-pick each commit's changes without committing
+    $applied = 0
+    for ($idx = 0; $idx -lt $hashes.Count; $idx++) {
+        $h = $hashes[$idx]
+        wh "  >> git cherry-pick --no-commit $h" DarkGray
+        $out = & git cherry-pick --no-commit $h 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $conflicted = @(& git diff --name-only --diff-filter=U 2>&1)
+            if ($conflicted.Count -gt 0) {
+                wh "" ; wh "  [!] MERGE CONFLICT while applying $h" Red
+                foreach ($l in $out) { wh "      $l" DarkRed }
+                wh "" ; wh "  Conflicted file(s):" Yellow
+                foreach ($f in $conflicted) { wh "    - $f" Yellow }
+                wh "" ; wh "  How do you want to proceed?" DarkCyan ; wh ""
+                wh "    [1]  Stage everything as-is (git add -A) and continue" White
+                wh "    [2]  Cancel — roll back everything done so far" White
+                wh ""
+                $handled = $false
+                while ($true) {
+                    $choice = Ask "Select [1 or 2]:"
+                    if ($choice -eq '1') {
+                        wh ""
+                        wh "  >> git add -A" DarkGray
+                        & git add -A 2>&1 | Out-Null
+                        wh "  >> git cherry-pick --quit" DarkGray
+                        & git cherry-pick --quit 2>&1 | Out-Null
+                        wh "  [OK] Staged as-is (conflict markers may remain — review before final commit!)" Yellow
+                        $applied++
+                        $handled = $true
+                        break
+                    }
+                    if ($choice -eq '2') {
+                        & git cherry-pick --abort 2>&1 | Out-Null
+                        if ($applied -gt 0) { & git reset --hard HEAD 2>&1 | Out-Null }
+                        if ($createNew) {
+                            & git checkout $origBranch 2>&1 | Out-Null
+                            & git branch -D $targetBranch 2>&1 | Out-Null
+                            wh "  [!] Rolled back — '$targetBranch' deleted, back on '$origBranch'." Yellow
+                        } else {
+                            & git reset --hard HEAD 2>&1 | Out-Null
+                            wh "  [!] Rolled back staged changes on '$targetBranch'." Yellow
+                        }
+                        Pause-Return; return
+                    }
+                    wh "  [!] Enter 1 or 2." Red
+                }
+                if ($handled) { continue }
+            }
+            wh "  [X] Cherry-pick of '$h' failed — rolling back" Red
+            foreach ($l in $out) { wh "      $l" DarkRed }
+            & git cherry-pick --abort 2>&1 | Out-Null
+            if ($applied -gt 0) { & git reset --hard HEAD 2>&1 | Out-Null }
+            if ($createNew) {
+                & git checkout $origBranch 2>&1 | Out-Null
+                & git branch -D $targetBranch 2>&1 | Out-Null
+                wh "  [!] Rolled back — '$targetBranch' deleted, back on '$origBranch'." Yellow
+            } else {
+                & git reset --hard HEAD 2>&1 | Out-Null
+                wh "  [!] Rolled back staged changes on '$targetBranch'." Yellow
+            }
+            Pause-Return; return
+        }
+        $applied++
+        wh "  [OK] Staged ($applied/$($hashes.Count))" Green
+    }
+    wh ""
+
+    # Step 3: combine everything into a single commit
+    wh "  >> git commit -m `"$msg`"" DarkGray
+    $out = & git commit -m $msg 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        wh "  [X] Commit failed" Red
+        foreach ($l in $out) { wh "      $l" DarkRed }
+        wh "  [!] Changes remain staged on '$targetBranch' — resolve manually." Yellow
+        Pause-Return; return
+    }
+
+    wh "  [OK] Squashed commit created!" Green ; wh ""
+    wh "  ┌──────────────────────────────────────────┐" Green
+    wh "  │   [OK]  Multi-Pick Squash completed!     │" Green
+    wh "  └──────────────────────────────────────────┘" Green
+    wh "" ; (& git log --oneline -3 2>&1) | ForEach-Object { wh "    $_" Green }
+    Pause-Return
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main menu
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1192,6 +1416,7 @@ function Show-MainMenu {
     wh "    [9]   Multi-Commit Rescue    Move N commits to a new branch" Cyan
     wh "    [10]  Reflog Recovery        Browse reflog and recover lost commits" Cyan
     wh "    [11]  Amend + Force Push     Amend last commit with safe force-with-lease" Cyan
+    wh "    [12]  Multi-Pick Squash      N commits from anywhere -> one squashed commit" Cyan
     wh "    [0]   Exit" Cyan
     wh "" ; Sep ; wh ""
     wh "  Type Q at any prompt to cancel and return here." DarkGray ; wh ""
@@ -1225,6 +1450,7 @@ while ($true) {
         '9'            { Invoke-MultiCommitRescue     }
         '10'           { Invoke-ReflogRecovery        }
         '11'           { Invoke-AmendForcePush        }
+        '12'           { Invoke-MultiPickSquash       }
         '0'            { wh "" ; wh "  Goodbye!" Cyan ; wh "" ; exit 0 }
         { Is-Quit $_ } { wh "" ; wh "  Goodbye!" Cyan ; wh "" ; exit 0 }
         default {

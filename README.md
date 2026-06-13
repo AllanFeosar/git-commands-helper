@@ -67,6 +67,7 @@ The launcher checks for `pwsh`, shows install instructions if missing, then star
     [9]   Multi-Commit Rescue    Move N commits to a new branch
     [10]  Reflog Recovery        Browse reflog and recover lost commits
     [11]  Amend + Force Push     Amend last commit with safe force-with-lease
+    [12]  Multi-Pick Squash      N commits from anywhere -> one squashed commit
     [0]   Exit
 ```
 
@@ -329,6 +330,43 @@ git push --force-with-lease
 
 ---
 
+### [12] Multi-Pick Squash — N commits from anywhere, squashed into one
+
+**What it does:**
+Picks 2–10 commits from anywhere in the repo (any branch, any order) and squashes them into a single commit on a new or existing branch. Unlike Range Pick (Option 2), the commits don't need to be in a contiguous range or even on the same branch.
+
+**Steps it walks you through:**
+1. How many commits (2–10), then each commit hash (validated against the repo) — entered in the order they'll be applied
+2. Target branch: create a NEW branch (from any base branch/commit) or use an EXISTING branch
+3. Combined commit message
+
+**Under the hood:**
+```
+git checkout -b <new-branch> <base>     (or git checkout <existing-branch>)
+git cherry-pick --no-commit <hash-1>
+git cherry-pick --no-commit <hash-2>
+...
+git commit -m "<combined message>"
+```
+
+**If a merge conflict happens mid-pick**, you're asked how to proceed:
+1. **Stage everything as-is** — `git add -A` + `git cherry-pick --quit`, then continues to the next commit (review the result before the final commit!)
+2. **Cancel** — aborts the pick, resets any already-staged changes, and (for a new branch) deletes the branch and returns you to where you started
+
+Any *non-conflict* failure (e.g. an already-applied/empty commit) always rolls back automatically — no half-finished state.
+
+**Sample problems it solves:**
+
+> *"I have 3 related commits scattered across `feature/payments`, `feature/billing`, and `hotfix/patient-api` — I want them combined into one clean commit on a new branch for review."*
+- Run option 12, create new branch `dhahari-All-patient-Apis` based on `main`, enter the 3 hashes in order, give it one message — done.
+
+> *"I started Range Pick (Option 2) but my 3 commits aren't a contiguous range — they're on different branches."*
+- Option 12 doesn't require a contiguous range; pick the exact commits you need regardless of where they live.
+
+**Important:** Requires a clean working tree before starting. Cherry-picks are applied in the order you enter them — pick an order that minimizes conflicts (usually chronological).
+
+---
+
 ## Tips
 
 - Always run from inside your git repository folder, or use the full path (Option C above)
@@ -336,3 +374,4 @@ git push --force-with-lease
 - Option [4] Conflict Pre-Check is free — run it before any broadcast to avoid surprises
 - Options [5], [6], [8], [9], and [11] rewrite history — only use them on commits that have not been pushed yet (or with caution on personal branches)
 - Option [10] is always safe to browse — creating a branch from reflog never modifies your current branch
+- Option [12] cherry-picks are non-destructive to source branches — only the target branch is affected
