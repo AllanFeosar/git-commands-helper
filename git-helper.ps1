@@ -61,8 +61,40 @@ function Invoke-Checkout([string]$Branch) {
         foreach ($l in $out) { wh "      $l" DarkRed }
         return $false
     }
+    $null = & git symbolic-ref -q HEAD 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        wh "  [X] '$Branch' is not a branch — checkout left the repo in detached HEAD" Red
+        wh "      Returning to where you started..." DarkRed
+        & git checkout - 2>&1 | Out-Null
+        return $false
+    }
     wh "  [OK] On branch: $Branch" Green
     return $true
+}
+
+function Confirm-Proceed {
+    $go = Ask "Proceed? [Y/N]:"
+    if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return $false }
+    return $true
+}
+
+# Any ref (branch, tag, commit) with this name already exists
+function Test-RefExists([string]$Name) {
+    $null = & git rev-parse --verify $Name 2>&1
+    return ($LASTEXITCODE -eq 0)
+}
+
+# A local BRANCH (not a tag/detached commit) with this name exists
+function Test-LocalBranchExists([string]$Name) {
+    & git show-ref --verify --quiet "refs/heads/$Name" 2>&1 | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
+# Number of commits HEAD is ahead of its upstream, or $null if no upstream configured
+function Get-AheadOfUpstreamCount {
+    $null = & git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>&1
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return [int][string](& git rev-list --count "@{u}..HEAD" 2>$null)
 }
 
 # ─── Input / UI helpers ───────────────────────────────────────────────────────
@@ -184,8 +216,7 @@ function Invoke-CherryPick {
         "Commit message  : $(Clip $msg)"
     )
     wh ""
-    $go = Ask "Proceed? [Y/N]:"
-    if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+    if (-not (Confirm-Proceed)) { return }
     wh "" ; Sep ; wh ""
     wh "  Executing..." DarkCyan ; wh ""
 
@@ -305,8 +336,7 @@ function Invoke-RangePick {
     $rows.Add("Target branch   : $(Clip $branch)")
     Draw-Box $rows.ToArray()
     wh ""
-    $go = Ask "Proceed? [Y/N]:"
-    if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+    if (-not (Confirm-Proceed)) { return }
     wh "" ; Sep ; wh ""
     wh "  Executing..." DarkCyan ; wh ""
     if (-not (Invoke-Checkout $branch)) { Pause-Return; return }
@@ -316,6 +346,12 @@ function Invoke-RangePick {
     if ($LASTEXITCODE -ne 0) {
         wh "  [X] '$startHash' appears to be the root commit (has no parent)." Red
         wh "  Range pick cannot start from the root commit — choose the next commit instead." DarkGray
+        Pause-Return; return
+    }
+    & git merge-base --is-ancestor $startHash $endHash 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        wh "  [X] '$startHash' is not an ancestor of '$endHash' — this range would not make sense." Red
+        wh "  Make sure both hashes are on the same line of history, with start before end." DarkGray
         Pause-Return; return
     }
     $range = "$startHash^..$endHash"
@@ -402,8 +438,7 @@ function Invoke-HotfixBroadcast {
         "Push after each : $(if ($push) { 'Yes' } else { 'No' })"
     )
     wh ""
-    $go = Ask "Proceed? [Y/N]:"
-    if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+    if (-not (Confirm-Proceed)) { return }
     wh "" ; Sep ; wh ""
 
     $orig    = Get-CurrentBranch
@@ -437,13 +472,29 @@ function Invoke-HotfixBroadcast {
         } else { $results.Add("OK    | $b  (applied)") }
         wh ""
     }
+    $returnedToOrig = $true
     if ($orig) {
         $co = & git checkout $orig 2>&1
         if ($LASTEXITCODE -eq 0) { wh "  Returned to: $orig" DarkGray }
-        else { wh "  [!] Could not return to '$orig' — you are on the last processed branch" Yellow }
+        else {
+            $returnedToOrig = $false
+            wh "  [!] Could not return to '$orig' — you are on the last processed branch" Yellow
+        }
         wh ""
     }
-    if ($didBcStash) { & git stash pop 2>&1 | Out-Null ; wh "  [OK] Stash restored" DarkGray ; wh "" }
+    if ($didBcStash) {
+        if ($returnedToOrig) {
+            $out = & git stash pop 2>&1
+            if ($LASTEXITCODE -eq 0) { wh "  [OK] Stash restored" DarkGray }
+            else {
+                wh "  [!] Could not restore stash automatically — run 'git stash pop' manually" Yellow
+                foreach ($l in $out) { wh "      $l" DarkRed }
+            }
+        } else {
+            wh "  [!] Skipped restoring stash — switch to '$orig' and run 'git stash pop' manually" Yellow
+        }
+        wh ""
+    }
     Sep ; wh "" ; wh "  BROADCAST RESULTS" DarkCyan ; wh ""
     foreach ($r in $results) {
         if   ($r.StartsWith("OK"))   { wh "    $r" Green  }
@@ -506,9 +557,25 @@ function Invoke-ConflictPreCheck {
     $pickExit = $LASTEXITCODE
     if ($pickExit -ne 0) { & git cherry-pick --abort 2>&1 | Out-Null }
     else                 { & git reset --hard HEAD 2>&1 | Out-Null }
-    if ($origBranch)   { & git checkout $origBranch 2>&1 | Out-Null }
-    elseif ($origSha)  { & git checkout $origSha    2>&1 | Out-Null }
-    if ($didStash)     { & git stash pop 2>&1 | Out-Null }
+    $co = $null
+    if ($origBranch)   { $co = & git checkout $origBranch 2>&1 }
+    elseif ($origSha)  { $co = & git checkout $origSha    2>&1 }
+    $returnedOk = ($null -eq $co -or $LASTEXITCODE -eq 0)
+    if (-not $returnedOk) {
+        wh "  [!] Could not return to your original position automatically" Yellow
+        foreach ($l in $co) { wh "      $l" DarkRed }
+    }
+    if ($didStash) {
+        if ($returnedOk) {
+            $out = & git stash pop 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                wh "  [!] Could not restore stash automatically — run 'git stash pop' manually" Yellow
+                foreach ($l in $out) { wh "      $l" DarkRed }
+            }
+        } else {
+            wh "  [!] Skipped restoring stash — return to your original branch and run 'git stash pop' manually" Yellow
+        }
+    }
 
     Sep ; wh ""
     if ($pickExit -eq 0) {
@@ -567,8 +634,18 @@ function Invoke-WrongBranchRescue {
         "To branch       : $target"
     )
     wh "" ; wh "  WARNING: Rewrites history on '$origBranch'. Only safe if NOT pushed." Yellow ; wh ""
-    $go = Ask "Proceed? [Y/N]:"
-    if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+    $ahead = Get-AheadOfUpstreamCount
+    if ($null -ne $ahead -and $ahead -eq 0) {
+        Draw-Box @(
+            "DANGER: '$origBranch' is up to date with its remote.",
+            "This commit may already be pushed/shared."
+        ) Red
+        wh ""
+        $conf = Ask "Type FORCE to confirm rewriting pushed history:"
+        if ($conf -ne 'FORCE') { wh "  Cancelled." Yellow; Pause-Return; return }
+    } else {
+        if (-not (Confirm-Proceed)) { return }
+    }
     wh "" ; Sep ; wh ""
     wh "  Executing..." DarkCyan ; wh ""
 
@@ -620,12 +697,14 @@ function Invoke-UndoLastPick {
     wh "  Branch         : $branch" DarkCyan
     wh "  Last commit    : $lastLine" White ; wh ""
 
-    $origHead    = & git rev-parse ORIG_HEAD 2>&1
-    $hasOrigHead = ($LASTEXITCODE -eq 0)
+    $origHead      = & git rev-parse ORIG_HEAD 2>&1
+    $hasOrigHead   = ($LASTEXITCODE -eq 0)
+    $lastReflogMsg = [string](& git reflog -1 --format="%gs" 2>&1)
+    $origHeadIsLastPick = ($hasOrigHead -and $lastReflogMsg -match '^cherry-pick:')
     $trackRef    = & git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>&1
     $hasUpstream = ($LASTEXITCODE -eq 0)
     if ($hasUpstream) {
-        $aheadCount = @(& git rev-list "@{u}..HEAD" --oneline 2>&1).Count
+        $aheadCount = [int][string](& git rev-list --count "@{u}..HEAD" 2>$null)
         $notPushed  = ($aheadCount -gt 0)
         $statusInfo = if ($notPushed) { "$aheadCount commit(s) ahead of remote" } else { "up to date with remote" }
     } else {
@@ -635,20 +714,23 @@ function Invoke-UndoLastPick {
 
     wh "  Remote status  : $statusInfo" DarkGray ; wh ""
 
-    if ($notPushed -and $hasOrigHead) {
+    $useReset = ($notPushed -and $origHeadIsLastPick)
+    if ($useReset) {
         wh "  Strategy: RESET  (not yet pushed)" Green ; wh ""
         Draw-Box @("Command : git reset --hard ORIG_HEAD","Effect  : Completely removes the cherry-pick commit","Safe    : Yes — was never on the remote") Green
     } else {
         wh "  Strategy: REVERT  (may be on remote)" Yellow ; wh ""
+        if ($hasOrigHead -and -not $origHeadIsLastPick) {
+            wh "  Note: ORIG_HEAD does not correspond to the last cherry-pick — using revert for safety." DarkGray ; wh ""
+        }
         Draw-Box @("Command : git revert HEAD --no-edit","Effect  : New commit that undoes the cherry-pick","Safe    : Yes — no history rewrite") Yellow
     }
     wh ""
-    $go = Ask "Proceed? [Y/N]:"
-    if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+    if (-not (Confirm-Proceed)) { return }
     wh "" ; Sep ; wh ""
     wh "  Executing..." DarkCyan ; wh ""
 
-    if ($notPushed -and $hasOrigHead) {
+    if ($useReset) {
         wh "  >> git reset --hard ORIG_HEAD" DarkGray
         $out = & git reset --hard ORIG_HEAD 2>&1
         if ($LASTEXITCODE -ne 0) { wh "  [X] Reset failed" Red ; foreach ($l in $out) { wh "      $l" DarkRed } ; Pause-Return; return }
@@ -742,6 +824,7 @@ function Invoke-CommitFixup {
         if (-not (Test-Hash $target))               { wh "  [!] Invalid hash." Red; continue }
         $null = & git cat-file -t $target 2>&1
         if ($LASTEXITCODE -ne 0)                    { wh "  [!] Commit not found." Red; continue }
+        if (-not (Test-RefExists "$target^"))       { wh "  [!] '$target' is the root commit (no parent) — cannot autosquash into it." Red; continue }
         break
     }
     wh "" ; wh "  Stage mode:" DarkCyan
@@ -758,8 +841,7 @@ function Invoke-CommitFixup {
     $tLine = [string](& git log --oneline -1 $target 2>&1)
     Draw-Box @("Fixing commit   : $(Clip $tLine)","Stage mode      : $(if ($stageMode -eq '1') { 'Stage all' } else { 'Use existing index' })")
     wh ""
-    $go = Ask "Proceed? [Y/N]:"
-    if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+    if (-not (Confirm-Proceed)) { return }
     wh "" ; Sep ; wh ""
     wh "  Executing fixup..." DarkCyan ; wh ""
 
@@ -833,6 +915,10 @@ function Invoke-MultiCommitRescue {
         if ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le 10) { $count = [int]$n; break }
         wh "  [!] Enter a number between 1 and 10." Red
     }
+    if (-not (Test-RefExists "HEAD~$count")) {
+        wh "" ; wh "  [X] '$origBranch' has fewer than $($count + 1) commit(s) — cannot move $count." Red
+        Pause-Return; return
+    }
     wh ""
     wh "  These $count commit(s) will be moved:" DarkGray
     for ($i = 0; $i -lt $count -and $i -lt $logLines.Count; $i++) {
@@ -849,8 +935,7 @@ function Invoke-MultiCommitRescue {
         if ([string]::IsNullOrWhiteSpace($newBranch))  { wh "  [!] Cannot be empty." Red; continue }
         if ($newBranch -eq $origBranch)                { wh "  [!] Same as current branch." Red; continue }
         # Check branch doesn't already exist
-        $check = & git rev-parse --verify $newBranch 2>&1
-        if ($LASTEXITCODE -eq 0) { wh "  [!] Branch '$newBranch' already exists. Choose a different name." Red; continue }
+        if (Test-RefExists $newBranch) { wh "  [!] Branch '$newBranch' already exists. Choose a different name." Red; continue }
         break
     }
     wh "" ; Sep ; wh ""
@@ -866,8 +951,18 @@ function Invoke-MultiCommitRescue {
     wh "  Step 2: Reset '$origBranch' back $count commit(s)" DarkGray
     wh ""
     wh "  WARNING: Rewrites history on '$origBranch'. Only safe if NOT pushed." Yellow ; wh ""
-    $go = Ask "Proceed? [Y/N]:"
-    if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+    $ahead = Get-AheadOfUpstreamCount
+    if ($null -ne $ahead -and $ahead -lt $count) {
+        Draw-Box @(
+            "DANGER: only $ahead of these $count commit(s) are unpushed.",
+            "Some may already be on the remote — rewriting affects shared history."
+        ) Red
+        wh ""
+        $conf = Ask "Type FORCE to confirm rewriting pushed history:"
+        if ($conf -ne 'FORCE') { wh "  Cancelled." Yellow; Pause-Return; return }
+    } else {
+        if (-not (Confirm-Proceed)) { return }
+    }
     wh "" ; Sep ; wh ""
     wh "  Executing..." DarkCyan ; wh ""
 
@@ -970,15 +1065,13 @@ function Invoke-ReflogRecovery {
             $newBranch = Ask "Branch name:"
             if (Is-Quit $newBranch)                        { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
             if ([string]::IsNullOrWhiteSpace($newBranch))  { wh "  [!] Cannot be empty." Red; continue }
-            $chk = & git rev-parse --verify $newBranch 2>&1
-            if ($LASTEXITCODE -eq 0) { wh "  [!] Branch '$newBranch' already exists. Choose a different name." Red; continue }
+            if (Test-RefExists $newBranch) { wh "  [!] Branch '$newBranch' already exists. Choose a different name." Red; continue }
             break
         }
         wh "" ; Sep ; wh ""
         Draw-Box @("Action  : Create new branch","Branch  : $newBranch","At SHA  : $(Clip $chosenSha)")
         wh ""
-        $go = Ask "Proceed? [Y/N]:"
-        if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+        if (-not (Confirm-Proceed)) { return }
         wh "" ; wh "  >> git branch $newBranch $chosenSha" DarkGray
         $out = & git branch $newBranch $chosenSha 2>&1
         if ($LASTEXITCODE -ne 0) {
@@ -993,8 +1086,20 @@ function Invoke-ReflogRecovery {
         Draw-Box @("Action  : Hard-reset current branch","Branch  : $curBranch","To SHA  : $(Clip $chosenSha)") Red
         wh "" ; wh "  WARNING: This rewrites history on '$curBranch'." Red
         wh "  Any commits after this SHA will be LOST unless on another branch." Red ; wh ""
-        $go = Ask "Type YES to confirm destructive reset:"
-        if ($go -ne 'YES') { wh "  Cancelled." Yellow; Pause-Return; return }
+        $ahead        = Get-AheadOfUpstreamCount
+        $discardCount = [int][string](& git rev-list --count "$chosenSha..HEAD" 2>$null)
+        if ($null -ne $ahead -and $discardCount -gt $ahead) {
+            Draw-Box @(
+                "DANGER: $($discardCount - $ahead) of the $discardCount commit(s) being",
+                "discarded appear to already be pushed to the remote."
+            ) Red
+            wh ""
+            $go = Ask "Type FORCE to confirm discarding pushed history:"
+            if ($go -ne 'FORCE') { wh "  Cancelled." Yellow; Pause-Return; return }
+        } else {
+            $go = Ask "Type YES to confirm destructive reset:"
+            if ($go -ne 'YES') { wh "  Cancelled." Yellow; Pause-Return; return }
+        }
         wh "" ; wh "  >> git reset --hard $chosenSha" DarkGray
         $out = & git reset --hard $chosenSha 2>&1
         if ($LASTEXITCODE -ne 0) {
@@ -1118,8 +1223,7 @@ function Invoke-AmendForcePush {
         $conf = Ask "Confirmation:"
         if ($conf -ne 'FORCE') { wh "  Cancelled." Yellow; Pause-Return; return }
     } else {
-        $go = Ask "Proceed? [Y/N]:"
-        if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+        if (-not (Confirm-Proceed)) { return }
     }
     wh "" ; Sep ; wh ""
     wh "  Executing..." DarkCyan ; wh ""
@@ -1206,8 +1310,7 @@ function Invoke-MultiPickSquash {
             if (Is-Quit $h) { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
             if ([string]::IsNullOrWhiteSpace($h)) { wh "  [!] Cannot be empty." Red; continue }
             if (-not (Test-Hash $h))              { wh "  [!] Invalid git hash." Red; continue }
-            & git rev-parse --verify "$h^{commit}" 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) { wh "  [!] Commit '$h' not found in this repo." Red; continue }
+            if (-not (Test-RefExists "$h^{commit}")) { wh "  [!] Commit '$h' not found in this repo." Red; continue }
             $hashes.Add($h)
             break
         }
@@ -1234,8 +1337,7 @@ function Invoke-MultiPickSquash {
             $targetBranch = Ask "New branch name:"
             if (Is-Quit $targetBranch)                       { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
             if ([string]::IsNullOrWhiteSpace($targetBranch)) { wh "  [!] Cannot be empty." Red; continue }
-            & git rev-parse --verify $targetBranch 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { wh "  [!] Branch '$targetBranch' already exists. Choose a different name." Red; continue }
+            if (Test-RefExists $targetBranch) { wh "  [!] Branch '$targetBranch' already exists. Choose a different name." Red; continue }
             break
         }
         wh ""
@@ -1243,8 +1345,7 @@ function Invoke-MultiPickSquash {
             $baseRef = Ask "Base branch/commit for '$targetBranch' (blank = current '$origBranch'):"
             if (Is-Quit $baseRef) { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
             if ([string]::IsNullOrWhiteSpace($baseRef)) { $baseRef = $origBranch }
-            & git rev-parse --verify $baseRef 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) { wh "  [!] '$baseRef' is not a valid branch/commit." Red; continue }
+            if (-not (Test-RefExists $baseRef)) { wh "  [!] '$baseRef' is not a valid branch/commit." Red; continue }
             break
         }
     } else {
@@ -1252,8 +1353,7 @@ function Invoke-MultiPickSquash {
             $targetBranch = Ask "Existing branch name:"
             if (Is-Quit $targetBranch)                       { wh "  Cancelled." DarkGray; Start-Sleep -Milliseconds 400; return }
             if ([string]::IsNullOrWhiteSpace($targetBranch)) { wh "  [!] Cannot be empty." Red; continue }
-            & git rev-parse --verify $targetBranch 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) { wh "  [!] Branch '$targetBranch' does not exist." Red; continue }
+            if (-not (Test-LocalBranchExists $targetBranch)) { wh "  [!] Branch '$targetBranch' does not exist." Red; continue }
             break
         }
     }
@@ -1284,8 +1384,7 @@ function Invoke-MultiPickSquash {
     $rows.Add("New message     : $(Clip $msg)")
     Draw-Box $rows.ToArray()
     wh ""
-    $go = Ask "Proceed? [Y/N]:"
-    if ($go -notmatch '^[yY]$') { wh "  Cancelled." Yellow; Pause-Return; return }
+    if (-not (Confirm-Proceed)) { return }
     wh "" ; Sep ; wh ""
     wh "  Executing..." DarkCyan ; wh ""
 
